@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net.Http;
@@ -16,28 +17,24 @@ using Newtonsoft.Json.Linq;
 
 namespace Lesson_203
 {
+    public class Device
+    {        
+        public IBmp280 Reader { get; set; }
+        public string IotHubName { get; set; }
+        public string IotHubKey { get; set; }
+    }
+
     /// <summary>
     ///     An empty page that can be used on its own or navigated to within a Frame.
     /// </summary>
     public sealed partial class MainPage
     {
-        //A class which wraps the barometric sensor
-        private IBmp280 _bmp280;
-
         // IOT hub connection string
         private const string IotHubUri = "mohitweather.azure-devices.net";
-#if PI
-    // myBmp280
-        private const string DeviceId = "myBmp280";
-#else
-        // myMockBmp280
-        private const string DeviceId = "myMockBmp280";
-#endif
-        private string _deviceKey = "<obtained from secrets.json>";
-        private string _openWeatherKey = "<obtained from secrets.json>";
+        private readonly List<Device> _devices = new List<Device>();
 
         // ReSharper disable once NotAccessedField.Local
-        private Timer _timer;
+        private readonly List<Timer> _timers = new List<Timer>();
 
         public MainPage()
         {
@@ -49,57 +46,64 @@ namespace Lesson_203
         {
             Debug.WriteLine("MainPage::OnNavigatedTo");
 
-            await ReadConfigAsync();
+            var secrets = await ReadConfigAsync();
             //MakePinWebAPICall();
 
-            //Create a new object for our barometric sensor class
+            _devices.Add(new Device { Reader = new MockBmp280((string)secrets["openWeather"]), IotHubName = "bellevueSensor", IotHubKey = (string)secrets["bellevueSensor"] });
 #if PI
-            _bmp280 = new Bmp280();
-#else
-            _bmp280 = new MockBmp280(_openWeatherKey);
+            _devices.Add(new Device { Reader = new Bmp280(), IotHubName = "myBmp280", IotHubKey = (string)secrets["myBmp280"] });
 #endif
-            //InitializeAsync the sensor
-            await _bmp280.InitializeAsync();
 
-            var deviceClient = DeviceClient.Create(
-                IotHubUri,
-                new DeviceAuthenticationWithRegistrySymmetricKey(DeviceId, _deviceKey),
-                TransportType.Http1);
-
-            //Create variables to store the sensor data: temperature, pressure and altitude. 
-            //InitializeAsync them to 0.
-            float temp;
-            float press;
-            float altitude;
-
-            //Create a constant for pressure at sea level. 
-            //This is based on your local sea level pressure (Unit: Hectopascal)
-            const float seaLevelPressure = 1013.25f;
-
-            _timer = new Timer(async e =>
+            //Create a new object for our barometric sensor class
+            foreach (var device in _devices)
             {
-                temp = await _bmp280.ReadTemperatureAsync();
-                press = await _bmp280.ReadPreasureAsync();
-                altitude = await _bmp280.ReadAltitudeAsync(seaLevelPressure);
+                //InitializeAsync the sensor
+                await device.Reader.InitializeAsync();
 
-                //Write the values to your debug console
-                Debug.WriteLine("Temperature: " + temp.ToString(CultureInfo.InvariantCulture) + " deg C");
-                Debug.WriteLine("Pressure: " + press.ToString(CultureInfo.InvariantCulture) + " Pa");
-                Debug.WriteLine("Altitude: " + altitude.ToString(CultureInfo.InvariantCulture) + " m");
+                var deviceClient = DeviceClient.Create(
+                    IotHubUri,
+                    new DeviceAuthenticationWithRegistrySymmetricKey(device.IotHubName, device.IotHubKey),
+                    TransportType.Http1);
 
-                //Send it to IoT Hub
-                var telemetryDataPoint = new
+                //Create a constant for pressure at sea level. 
+                //This is based on your local sea level pressure (Unit: Hectopascal)
+                const float seaLevelPressure = 1013.25f;
+
+                var timer = new Timer(async e =>
                 {
-                    deviceId = DeviceId,
-                    temperature = temp,
-                    pressure = press
-                };
-                var messageString = JsonConvert.SerializeObject(telemetryDataPoint);
-                var message = new Message(Encoding.ASCII.GetBytes(messageString));
+                    float temp = await device.Reader.ReadTemperatureAsync();
+                    float press = await device.Reader.ReadPreasureAsync();
+                    float altitude = await device.Reader.ReadAltitudeAsync(seaLevelPressure);
 
-                await deviceClient.SendEventAsync(message);
-                Debug.WriteLine("{0} > Sending message: {1}", DateTime.Now, messageString);
-            }, null, TimeSpan.FromMilliseconds(0), TimeSpan.FromMinutes(10));
+                    //Convert to farenheit
+                    temp = (float) (temp*1.8 + 32);
+
+                    //Write the values to your debug console
+                    Debug.WriteLine("Temperature: " + temp.ToString(CultureInfo.InvariantCulture) + " deg F");
+                    Debug.WriteLine("Pressure: " + press.ToString(CultureInfo.InvariantCulture) + " Pa");
+                    Debug.WriteLine("Altitude: " + altitude.ToString(CultureInfo.InvariantCulture) + " m");
+
+                    // Don't be fooled - this really is the Pacific time zone,
+                    // not just standard time...
+                    var zone = TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time");
+
+                    //Send it to IoT Hub
+                    var telemetryDataPoint = new
+                    {
+                        deviceId = device.IotHubName,
+                        temperature = temp,
+                        pressure = press,
+                        utcOffset = zone.BaseUtcOffset.Hours
+                    };
+                    var messageString = JsonConvert.SerializeObject(telemetryDataPoint);
+                    var message = new Message(Encoding.ASCII.GetBytes(messageString));
+
+                    await deviceClient.SendEventAsync(message);
+                    Debug.WriteLine("{0} > Sending message: {1}", DateTime.Now, messageString);
+                }, null, TimeSpan.FromMilliseconds(0), TimeSpan.FromMinutes(10));
+                // Necessary so timers are not garbage collected
+                _timers.Add(timer);
+            }            
         }
 
         // This method will put your pin on the world map of makers using this lesson.
@@ -126,17 +130,16 @@ namespace Lesson_203
             }
         }
 
-        public async Task ReadConfigAsync()
+        public async Task<JObject> ReadConfigAsync()
         {
             var packageFolder = Package.Current.InstalledLocation;
             var item = await packageFolder.TryGetItemAsync("secrets.json");
             if (item is StorageFile)
             {
                 var contents = await FileIO.ReadTextAsync(item as StorageFile);
-                var secrets = JsonConvert.DeserializeObject<JObject>(contents);
-                _deviceKey = (string) secrets[DeviceId];
-                _openWeatherKey = (string) secrets["openWeather"];
+                return JsonConvert.DeserializeObject<JObject>(contents);
             }
+            return new JObject();
         }
     }
 }
